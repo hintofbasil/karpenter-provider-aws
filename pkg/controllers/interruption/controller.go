@@ -23,7 +23,11 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/samber/lo"
 	"go.uber.org/multierr"
+	corev1 "k8s.io/api/core/v1"
 	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/klog/v2"
 	"k8s.io/utils/clock"
@@ -179,7 +183,12 @@ func (c *Controller) deleteMessage(ctx context.Context, msg *sqsapi.Message) err
 
 // handleNodeClaim retrieves the action for the message and then performs the appropriate action against the node
 func (c *Controller) handleNodeClaim(ctx context.Context, msg messages.Message, nodeClaim *v1beta1.NodeClaim, node *v1.Node) error {
-	action := actionForMessage(msg)
+	nodePool, err := c.resolveNodePoolFromNodeClaim(ctx, nodeClaim)
+	if err != nil && !errors.IsNotFound(err) {
+		return fmt.Errorf("getting NodePool from NodeClaim, %w", err)
+	}
+
+	action := actionForMessage(msg, nodePool)
 	ctx = log.IntoContext(ctx, log.FromContext(ctx).WithValues("NodeClaim", klog.KRef("", nodeClaim.Name), "action", string(action)))
 	if node != nil {
 		ctx = log.IntoContext(ctx, log.FromContext(ctx).WithValues("Node", klog.KRef("", node.Name)))
@@ -195,9 +204,10 @@ func (c *Controller) handleNodeClaim(ctx context.Context, msg messages.Message, 
 	).Inc()
 
 	// Mark the offering as unavailable in the ICE cache since we got a spot interruption warning
-	if msg.Kind() == messages.SpotInterruptionKind {
-		zone := nodeClaim.Labels[v1.LabelTopologyZone]
-		instanceType := nodeClaim.Labels[v1.LabelInstanceTypeStable]
+	// or rebalance recommendation with the feature enabled
+	if action != NoAction && (msg.Kind() == messages.SpotInterruptionKind || msg.Kind() == messages.RebalanceRecommendationKind) {
+		zone := nodeClaim.Labels[corev1.LabelTopologyZone]
+		instanceType := nodeClaim.Labels[corev1.LabelInstanceTypeStable]
 		if zone != "" && instanceType != "" {
 			c.unavailableOfferingsCache.MarkUnavailable(ctx, string(msg.Kind()), instanceType, zone, v1beta1.CapacityTypeSpot)
 		}
@@ -292,11 +302,28 @@ func (c *Controller) makeNodeInstanceIDMap(ctx context.Context) (map[string]*v1.
 	return m, nil
 }
 
-func actionForMessage(msg messages.Message) Action {
+func actionForMessage(msg messages.Message, _ *v1beta1.NodePool) Action {
 	switch msg.Kind() {
 	case messages.ScheduledChangeKind, messages.SpotInterruptionKind, messages.StateChangeKind:
+		return CordonAndDrain
+	case messages.RebalanceRecommendationKind:
+		// TODO if this is enabled in the nodePool
+		// if nodePool.Spec.Disruption.HandleRebalanceRecommendations:
+		//     return CordonAndDrain
+		// return NoAction
 		return CordonAndDrain
 	default:
 		return NoAction
 	}
+}
+
+func (c *Controller) resolveNodePoolFromNodeClaim(ctx context.Context, nodeClaim *v1beta1.NodeClaim) (*v1beta1.NodePool, error) {
+	if nodePoolName, ok := nodeClaim.Labels[v1beta1.NodePoolLabelKey]; ok {
+		nodePool := &v1beta1.NodePool{}
+		if err := c.kubeClient.Get(ctx, types.NamespacedName{Name: nodePoolName}, nodePool); err != nil {
+			return nil, err
+		}
+		return nodePool, nil
+	}
+	return nil, errors.NewNotFound(schema.GroupResource{Group: v1beta1.Group, Resource: "nodepools"}, "")
 }
