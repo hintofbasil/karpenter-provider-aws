@@ -5,9 +5,9 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 # shellcheck source=hack/release/common.sh
 source "${SCRIPT_DIR}/common.sh"
 
-git_tag="$(git describe --exact-match --tags || echo "no tag")"
-if [[ "${git_tag}" == "no tag" ]]; then
-  echo "Failed to release: commit is untagged"
+git_branch="$(git symbolic-ref --short HEAD || echo "no branch")"
+if [[ "${git_branch}" == "no branch" ]]; then
+  echo "Failed to release: commit is not part of a branch"
   exit 1
 fi
 commit_sha="$(git rev-parse HEAD)"
@@ -17,4 +17,4 @@ if [[ "$(git status --porcelain)" != "" ]]; then
   exit 1
 fi
 
-release "${commit_sha}" "${git_tag#v}"
+release "${commit_sha}" "${git_branch#v}"
